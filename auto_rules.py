@@ -1,180 +1,390 @@
-from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.fastmcp import FastMCP, Context
 import json
 import os
-import asyncio
-import logging
-from dataclasses import dataclass
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Optional
+import difflib
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Union, Tuple
+import logging
+from datetime import datetime
+import re
+import uuid
 
 # 로깅 설정
+LOG_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+LOG_FILE = LOG_DIR / "autorules.log"
+
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("AutoRulesServer")
+logger = logging.getLogger("AutoRules")
 
-# 규칙이 저장될 디렉토리
-RULES_DIR = Path("rules")
+# 파일 핸들러 추가
+file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
 
-@dataclass
-class Rule:
-    name: str
-    description: str
-    original_code: str
-    modified_code: str
-    feedback: str
-    tags: List[str] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "original_code": self.original_code,
-            "modified_code": self.modified_code,
-            "feedback": self.feedback,
-            "tags": self.tags or []
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Rule':
-        return cls(
-            name=data["name"],
-            description=data["description"],
-            original_code=data["original_code"],
-            modified_code=data["modified_code"],
-            feedback=data["feedback"],
-            tags=data.get("tags", [])
-        )
+logger.info(f"=== AutoRules 서버 시작 - 로그 파일: {LOG_FILE} ===")
+logger.info(f"현재 작업 디렉토리: {os.getcwd()}")
+logger.info(f"스크립트 위치: {os.path.abspath(__file__)}")
 
-class RuleManager:
-    def __init__(self):
-        self.rules: Dict[str, Rule] = {}
-        self._load_rules()
-    
-    def _load_rules(self) -> None:
-        """디스크에서 규칙 로딩"""
-        RULES_DIR.mkdir(exist_ok=True)
-        
-        for rule_file in RULES_DIR.glob("*.json"):
-            try:
-                with open(rule_file, "r", encoding="utf-8") as f:
-                    rule_data = json.load(f)
-                    rule = Rule.from_dict(rule_data)
-                    self.rules[rule.name] = rule
-                    logger.info(f"규칙 로드됨: {rule.name}")
-            except Exception as e:
-                logger.error(f"규칙 로드 실패: {rule_file.name}: {str(e)}")
-    
-    def save_rule(self, rule: Rule) -> None:
-        """규칙을 디스크에 저장"""
-        self.rules[rule.name] = rule
-        
-        try:
-            RULES_DIR.mkdir(exist_ok=True)
-            rule_path = RULES_DIR / f"{rule.name}.json"
-            
-            with open(rule_path, "w", encoding="utf-8") as f:
-                json.dump(rule.to_dict(), f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"규칙 저장됨: {rule.name}")
-        except Exception as e:
-            logger.error(f"규칙 저장 실패: {rule.name}: {str(e)}")
-    
-    def get_rule(self, name: str) -> Optional[Rule]:
-        """이름으로 규칙 조회"""
-        return self.rules.get(name)
-    
-    def delete_rule(self, name: str) -> bool:
-        """규칙 삭제"""
-        if name in self.rules:
-            try:
-                rule_path = RULES_DIR / f"{name}.json"
-                if rule_path.exists():
-                    rule_path.unlink()
-                del self.rules[name]
-                logger.info(f"규칙 삭제됨: {name}")
-                return True
-            except Exception as e:
-                logger.error(f"규칙 삭제 실패: {name}: {str(e)}")
-                return False
-        return False
-    
-    def list_rules(self) -> List[Dict[str, Any]]:
-        """모든 규칙 목록 조회"""
-        return [rule.to_dict() for rule in self.rules.values()]
-    
-    def search_rules(self, query: str = "", tags: List[str] = None) -> List[Dict[str, Any]]:
-        """쿼리와 태그로 규칙 검색"""
-        results = []
-        query = query.lower()
-        
-        for rule in self.rules.values():
-            # 쿼리 검색
-            matches_query = (not query) or any(
-                query in field.lower() 
-                for field in [rule.name, rule.description, rule.original_code, 
-                              rule.modified_code, rule.feedback]
-            )
-            
-            # 태그 검색
-            matches_tags = (not tags) or (rule.tags and all(tag in rule.tags for tag in tags))
-            
-            if matches_query and matches_tags:
-                results.append(rule.to_dict())
-                
-        return results
-
-@asynccontextmanager
-async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """서버 시작/종료 라이프사이클 관리"""
-    try:
-        logger.info("AutoRules 서버 시작 중...")
-        rule_manager = RuleManager()
-        logger.info(f"{len(rule_manager.rules)} 개의 규칙 로드됨")
-        
-        yield {"rule_manager": rule_manager}
-    finally:
-        logger.info("AutoRules 서버 종료 중...")
+# 환경 변수 디버깅 로그
+logger.info("====== 환경 변수 확인 ======")
+logger.info(f"AUTO_RULES_ROOT: {os.environ.get('AUTO_RULES_ROOT', '설정되지 않음')}")
+logger.info("===========================")
 
 # MCP 서버 생성
 mcp = FastMCP(
     "AutoRules",
-    description="LLM 코드 피드백을 통한 자동 규칙 생성 서버",
-    lifespan=server_lifespan
+    description="LLM 코드 생성을 위한 자동 규칙 시스템",
 )
 
-# 리소스 엔드포인트
+# 설정 및 상수
+CURSOR_RULES_DIR = ".cursor/rules"  # Cursor 규칙 디렉토리
+CURSOR_RULES_FILE = "auto_rules.mdc"  # Cursor 규칙 파일명
+AUTO_RULES_ROOT_ENV = "AUTO_RULES_ROOT"  # 환경 변수명
 
-@mcp.resource("rules://all")
-def get_all_rules() -> str:
-    """모든 규칙 조회"""
-    rule_manager = mcp.lifespan_context["rule_manager"]
-    rules = rule_manager.list_rules()
-    return json.dumps(rules, ensure_ascii=False, indent=2)
+# 환경 변수 확인
+auto_rules_root = os.environ.get(AUTO_RULES_ROOT_ENV)
 
-@mcp.resource("rules://{rule_name}")
-def get_rule_by_name(rule_name: str) -> str:
-    """특정 이름의 규칙 조회"""
-    rule_manager = mcp.lifespan_context["rule_manager"]
-    rule = rule_manager.get_rule(rule_name)
+# 애플리케이션 기본 경로
+if not auto_rules_root:
+    logger.warning(f"환경 변수 {AUTO_RULES_ROOT_ENV}가 설정되지 않았습니다. 현재 디렉토리를 사용합니다.")
+    auto_rules_root = os.getcwd()
+    os.environ[AUTO_RULES_ROOT_ENV] = auto_rules_root
+    logger.info(f"{AUTO_RULES_ROOT_ENV} 환경 변수를 {auto_rules_root}로 설정했습니다.")
+
+RULES_DIR = Path(auto_rules_root) / ".autorules"
+
+# Rules 저장 경로
+CURSOR_RULES_PATH = Path(auto_rules_root) / CURSOR_RULES_DIR / CURSOR_RULES_FILE
+
+# 규칙을 MDC 형식으로 변환하는 함수
+def convert_rules_to_mdc(rules: List[Dict[str, Any]]) -> str:
+    """규칙 리스트를 MDC 포맷으로 변환"""
+    mdc_content = f"# 자동 규칙 모음\n\n"
     
-    if not rule:
-        return json.dumps({"error": f"규칙을 찾을 수 없음: {rule_name}"})
+    for rule in rules:
+        rule_name = rule.get("name", "")
+        rule_description = rule.get("description", "")
+        rule_original_code = rule.get("original_code", "")
+        rule_modified_code = rule.get("modified_code", "")
+        
+        # 규칙 내용 추가
+        mdc_content += f"## {rule_name}\n\n"
+        mdc_content += f"{rule_description}\n\n"
+        
+        # 원본 코드와 수정된 코드 추가
+        mdc_content += "### 원본 코드\n\n"
+        mdc_content += f"```\n{rule_original_code}\n```\n\n"
+        mdc_content += "### 수정된 코드\n\n"
+        mdc_content += f"```\n{rule_modified_code}\n```\n\n"
     
-    return json.dumps(rule.to_dict(), ensure_ascii=False, indent=2)
+    return mdc_content
 
-@mcp.resource("rules://search/{query}")
-def search_rules(query: str) -> str:
-    """규칙 검색"""
-    rule_manager = mcp.lifespan_context["rule_manager"]
-    rules = rule_manager.search_rules(query)
-    return json.dumps(rules, ensure_ascii=False, indent=2)
+# MDC 형식을 JSON 규칙으로 변환하는 함수
+def convert_mdc_to_rules(mdc_content: str) -> List[Dict[str, Any]]:
+    """MDC 포맷에서 규칙 리스트로 변환"""
+    rules = []
+    
+    if not mdc_content or mdc_content.strip() == "":
+        return rules
+    
+    # 규칙 섹션 분리 (## 로 시작하는 부분)
+    rule_sections = re.split(r'(?=^## )', mdc_content, flags=re.MULTILINE)
+    
+    # 첫 번째 섹션은 일반적으로 문서 제목이므로 건너뜀
+    for section in rule_sections[1:]:
+        if not section.strip():
+            continue
+        
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+        
+        # 규칙 이름 추출
+        rule_name = lines[0].replace('## ', '').strip()
+        if not rule_name:
+            continue
+        
+        # 초기 규칙 데이터 생성
+        rule_data = {
+            "id": f"{rule_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "name": rule_name,
+            "description": "",
+            "original_code": "",
+            "modified_code": "",
+            "feedback": "MDC에서 추출",
+            "tags": [],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # 설명 부분 추출 (## 이름과 ### 원본 코드 사이)
+        description_lines = []
+        i = 1
+        while i < len(lines) and not lines[i].startswith('### 원본 코드'):
+            description_lines.append(lines[i])
+            i += 1
+        rule_data["description"] = '\n'.join(description_lines).strip()
+        
+        # 원본 코드 추출
+        if i < len(lines) and lines[i].startswith('### 원본 코드'):
+            i += 1  # ### 원본 코드 라인 건너뜀
+            code_lines = []
+            # ``` 찾기
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                i += 1
+            i += 1  # ``` 라인 건너뜀
+            
+            # 원본 코드 수집
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                code_lines.append(lines[i])
+                i += 1
+            rule_data["original_code"] = '\n'.join(code_lines)
+        
+        # 수정된 코드 추출
+        i += 1  # ``` 라인 건너뜀
+        while i < len(lines) and not lines[i].startswith('### 수정된 코드'):
+            i += 1
+        
+        if i < len(lines) and lines[i].startswith('### 수정된 코드'):
+            i += 1  # ### 수정된 코드 라인 건너뜀
+            code_lines = []
+            # ``` 찾기
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                i += 1
+            i += 1  # ``` 라인 건너뜀
+            
+            # 수정된 코드 수집
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                code_lines.append(lines[i])
+                i += 1
+            rule_data["modified_code"] = '\n'.join(code_lines)
+        
+        # 유효한 규칙이면 추가
+        if rule_data["name"] and (rule_data["original_code"] or rule_data["modified_code"]):
+            rules.append(rule_data)
+    
+    return rules
 
-# 도구 엔드포인트
+# 규칙을 MDC 파일로 저장하는 함수
+def save_rules_to_mdc(rules: List[Dict[str, Any]]) -> bool:
+    """규칙들을 MDC 파일에 저장하기"""
+    try:
+        # 환경 변수에서 루트 경로 가져오기
+        root_path = os.environ.get(AUTO_RULES_ROOT_ENV)
+        if not root_path:
+            logger.error(f"{AUTO_RULES_ROOT_ENV} 환경 변수가 설정되지 않았습니다.")
+            return False
+        
+        # 커서 규칙 디렉토리 경로 생성
+        cursor_rules_dir = os.path.join(root_path, CURSOR_RULES_DIR)
+        
+        # 디렉토리가 없으면 생성
+        os.makedirs(cursor_rules_dir, exist_ok=True)
+        
+        # MDC 파일 경로
+        cursor_rules_path = os.path.join(cursor_rules_dir, CURSOR_RULES_FILE)
+        
+        # 규칙을 MDC 형식으로 변환
+        mdc_content = convert_rules_to_mdc(rules)
+        
+        # MDC 파일에 저장
+        with open(cursor_rules_path, 'w', encoding='utf-8') as f:
+            f.write(mdc_content)
+        
+        logger.info(f"{len(rules)}개 규칙이 성공적으로 MDC 파일에 저장되었습니다: {cursor_rules_path}")
+        return True
+    except Exception as e:
+        logger.error(f"MDC 파일 저장 중 오류: {e}")
+        return False
 
+def load_all_rules() -> List[Dict[str, Any]]:
+    """모든 규칙 불러오기"""
+    # 환경 변수 확인
+    root_path = os.environ.get(AUTO_RULES_ROOT_ENV)
+    if not root_path:
+        logger.warning(f"{AUTO_RULES_ROOT_ENV} 환경 변수가 설정되지 않았습니다.")
+        return []
+    
+    # Cursor 규칙 파일 경로
+    cursor_rules_dir = os.path.join(root_path, CURSOR_RULES_DIR)
+    cursor_rules_path = os.path.join(cursor_rules_dir, CURSOR_RULES_FILE)
+    
+    # MDC 파일 존재 확인
+    if not os.path.exists(cursor_rules_path):
+        logger.info(f"MDC 파일이 존재하지 않습니다: {cursor_rules_path}")
+        return []
+    
+    try:
+        # MDC 파일에서 규칙 불러오기
+        with open(cursor_rules_path, 'r', encoding='utf-8') as f:
+            mdc_content = f.read()
+        
+        # MDC 콘텐츠에서 규칙 추출
+        rules = convert_mdc_to_rules(mdc_content)
+        logger.info(f"{len(rules)}개 규칙이 MDC 파일에서 로드되었습니다.")
+        return rules
+    except Exception as e:
+        logger.error(f"MDC 파일에서 규칙 로드 중 오류: {e}")
+        return []
+
+def load_rule(rule_name: str) -> Optional[Dict[str, Any]]:
+    """이름으로 규칙 불러오기"""
+    rules = load_all_rules()
+    
+    for rule in rules:
+        if rule.get("name") == rule_name:
+            return rule
+    
+    return None
+
+def add_rule(rule: Dict[str, Any]) -> Tuple[bool, str]:
+    """새 규칙 추가하기"""
+    try:
+        # 환경 변수에서 루트 경로 가져오기
+        root_path = os.environ.get(AUTO_RULES_ROOT_ENV)
+        if not root_path:
+            return False, f"{AUTO_RULES_ROOT_ENV} 환경 변수가 설정되지 않았습니다."
+        
+        # 규칙 이름 확인
+        rule_name = rule.get("name")
+        if not rule_name:
+            return False, "규칙 이름이 필요합니다."
+        
+        # 현재 규칙 불러오기
+        current_rules = load_all_rules()
+        
+        # 이미 존재하는 규칙인지 확인
+        for existing_rule in current_rules:
+            if existing_rule.get("name") == rule_name:
+                return False, f"'{rule_name}' 규칙이 이미 존재합니다."
+        
+        # 규칙 ID 생성 및 생성 시간 추가
+        rule["id"] = str(uuid.uuid4())
+        rule["created_at"] = datetime.now().isoformat()
+        
+        # 규칙 추가
+        current_rules.append(rule)
+        
+        # MDC 파일에 저장
+        if save_rules_to_mdc(current_rules):
+            return True, f"규칙 '{rule_name}'이(가) 추가되었습니다."
+        else:
+            return False, "MDC 파일 저장 중 오류가 발생했습니다."
+    except Exception as e:
+        return False, f"규칙 추가 중 오류 발생: {e}"
+
+def update_rule(rule: Dict[str, Any]) -> Tuple[bool, str]:
+    """기존 규칙 업데이트"""
+    try:
+        # 환경 변수에서 루트 경로 가져오기
+        root_path = os.environ.get(AUTO_RULES_ROOT_ENV)
+        if not root_path:
+            return False, f"{AUTO_RULES_ROOT_ENV} 환경 변수가 설정되지 않았습니다."
+        
+        # 규칙 이름 또는 ID 확인
+        rule_name = rule.get("name")
+        rule_id = rule.get("id")
+        
+        if not rule_name and not rule_id:
+            return False, "규칙 업데이트를 위해 이름 또는 ID가 필요합니다."
+        
+        # 현재 규칙 불러오기
+        current_rules = load_all_rules()
+        updated = False
+        
+        # 규칙 찾아서 업데이트
+        for i, existing_rule in enumerate(current_rules):
+            if (rule_id and existing_rule.get("id") == rule_id) or \
+               (rule_name and existing_rule.get("name") == rule_name):
+                # 원래 ID와 생성 시간 유지
+                original_id = existing_rule.get("id")
+                original_created_at = existing_rule.get("created_at")
+                
+                # ID와 생성 시간이 없는 경우 새로 생성
+                if not original_id:
+                    original_id = str(uuid.uuid4())
+                if not original_created_at:
+                    original_created_at = datetime.now().isoformat()
+                
+                # 업데이트 시간 추가
+                rule["id"] = original_id
+                rule["created_at"] = original_created_at
+                rule["updated_at"] = datetime.now().isoformat()
+                
+                # 규칙 업데이트
+                current_rules[i] = rule
+                updated = True
+                break
+        
+        if not updated:
+            return False, f"규칙 '{rule_name or rule_id}'을(를) 찾을 수 없습니다."
+        
+        # MDC 파일에 저장
+        if save_rules_to_mdc(current_rules):
+            return True, f"규칙 '{rule_name or rule_id}'이(가) 업데이트되었습니다."
+        else:
+            return False, "MDC 파일 저장 중 오류가 발생했습니다."
+    except Exception as e:
+        return False, f"규칙 업데이트 중 오류 발생: {e}"
+
+def delete_rule(rule_name: str) -> Tuple[bool, str]:
+    """규칙 삭제하기"""
+    try:
+        # 환경 변수에서 루트 경로 가져오기
+        root_path = os.environ.get(AUTO_RULES_ROOT_ENV)
+        if not root_path:
+            return False, f"{AUTO_RULES_ROOT_ENV} 환경 변수가 설정되지 않았습니다."
+        
+        # 현재 규칙 불러오기
+        current_rules = load_all_rules()
+        original_count = len(current_rules)
+        
+        # 해당 이름의 규칙 필터링
+        filtered_rules = [rule for rule in current_rules if rule.get("name") != rule_name]
+        
+        # 삭제된 규칙이 있는지 확인
+        if len(filtered_rules) == original_count:
+            return False, f"규칙 '{rule_name}'을(를) 찾을 수 없습니다."
+        
+        # MDC 파일에 저장
+        if save_rules_to_mdc(filtered_rules):
+            return True, f"규칙 '{rule_name}'이(가) 삭제되었습니다."
+        else:
+            return False, "MDC 파일 저장 중 오류가 발생했습니다."
+    except Exception as e:
+        return False, f"규칙 삭제 중 오류 발생: {e}"
+
+# 태그로 규칙 불러오기
+def load_rules_by_tags(tags: List[str]) -> List[Dict[str, Any]]:
+    """태그로 규칙 필터링"""
+    all_rules = load_all_rules()
+    if not tags:
+        return all_rules
+    
+    filtered_rules = []
+    for rule in all_rules:
+        rule_tags = rule.get("tags", [])
+        if any(tag in rule_tags for tag in tags):
+            filtered_rules.append(rule)
+    
+    return filtered_rules
+
+# MDC 문서에서 규칙 추출
+def extract_rules_from_mdc(mdc_content: str) -> List[Dict[str, Any]]:
+    """MDC 문서 콘텐츠에서 규칙 추출"""
+    return convert_mdc_to_rules(mdc_content)
+
+# MCP 도구: 새 규칙 추가
 @mcp.tool()
-def add_rule(ctx: Context, name: str, description: str, original_code: str, 
-             modified_code: str, feedback: str, tags: List[str] = None) -> str:
+def mcp_auto_rules_add_rule(
+    ctx: Context,
+    name: str,
+    description: str,
+    original_code: str,
+    modified_code: str,
+    feedback: str,
+    tags: Optional[List[str]] = None,
+) -> str:
     """
     새 규칙 추가
     
@@ -186,119 +396,42 @@ def add_rule(ctx: Context, name: str, description: str, original_code: str,
     - feedback: 사용자 피드백
     - tags: 규칙 태그 (선택사항)
     """
-    rule_manager = ctx.request_context.lifespan_context["rule_manager"]
+    # tags가 None이면 빈 리스트로 설정
+    tags_list = [] if tags is None else tags
     
-    # 중복 검사
-    if rule_manager.get_rule(name):
-        return f"에러: 이미 같은 이름의 규칙이 있습니다: {name}"
-    
-    # 새 규칙 생성
-    rule = Rule(
-        name=name,
-        description=description,
-        original_code=original_code,
-        modified_code=modified_code,
-        feedback=feedback,
-        tags=tags or []
-    )
-    
-    # 규칙 저장
-    rule_manager.save_rule(rule)
-    
-    return f"규칙 추가 성공: {name}"
-
-@mcp.tool()
-def update_rule(ctx: Context, name: str, description: str = None, original_code: str = None,
-                modified_code: str = None, feedback: str = None, tags: List[str] = None) -> str:
-    """
-    기존 규칙 업데이트
-    
-    Parameters:
-    - name: 규칙 이름
-    - description: 규칙 설명 (선택사항)
-    - original_code: 원본 코드 (선택사항)
-    - modified_code: 수정된 코드 (선택사항)
-    - feedback: 사용자 피드백 (선택사항)
-    - tags: 규칙 태그 (선택사항)
-    """
-    rule_manager = ctx.request_context.lifespan_context["rule_manager"]
-    
-    # 규칙 존재 확인
-    existing_rule = rule_manager.get_rule(name)
-    if not existing_rule:
-        return f"에러: 규칙을 찾을 수 없음: {name}"
-    
-    # 제공된 값만 업데이트
-    if description is not None:
-        existing_rule.description = description
-    if original_code is not None:
-        existing_rule.original_code = original_code
-    if modified_code is not None:
-        existing_rule.modified_code = modified_code
-    if feedback is not None:
-        existing_rule.feedback = feedback
-    if tags is not None:
-        existing_rule.tags = tags
-    
-    # 규칙 저장
-    rule_manager.save_rule(existing_rule)
-    
-    return f"규칙 업데이트 성공: {name}"
-
-@mcp.tool()
-def delete_rule(ctx: Context, name: str) -> str:
-    """
-    규칙 삭제
-    
-    Parameters:
-    - name: 삭제할 규칙 이름
-    """
-    rule_manager = ctx.request_context.lifespan_context["rule_manager"]
-    
-    if rule_manager.delete_rule(name):
-        return f"규칙 삭제 성공: {name}"
-    else:
-        return f"에러: 규칙 삭제 실패 또는 존재하지 않음: {name}"
-
-@mcp.tool()
-def apply_rules_to_code(ctx: Context, code: str, tags: List[str] = None) -> str:
-    """
-    기존 규칙을 적용하여 코드 수정
-    
-    Parameters:
-    - code: 수정할 코드
-    - tags: 적용할 규칙의 태그 (선택사항)
-    """
-    rule_manager = ctx.request_context.lifespan_context["rule_manager"]
-    
-    # 태그가 있으면 해당 태그의 규칙만 필터링
-    if tags:
-        rules = [rule for rule in rule_manager.rules.values() 
-                if rule.tags and all(tag in rule.tags for tag in tags)]
-    else:
-        rules = list(rule_manager.rules.values())
-    
-    modified_code = code
-    applied_rules = []
-    
-    # 규칙 적용
-    for rule in rules:
-        if rule.original_code in modified_code:
-            modified_code = modified_code.replace(rule.original_code, rule.modified_code)
-            applied_rules.append(rule.name)
-    
-    result = {
+    # 규칙 데이터 생성
+    rule_data = {
+        "name": name,
+        "description": description,
+        "original_code": original_code,
         "modified_code": modified_code,
-        "applied_rules": applied_rules,
-        "total_rules_applied": len(applied_rules)
+        "feedback": feedback,
+        "tags": tags_list
     }
     
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    # 규칙 추가 함수 호출
+    success, message = add_rule(rule_data)
+    
+    if success:
+        # 규칙이 추가된 경우 성공 메시지 반환
+        current_rules = load_all_rules()
+        return f"{message} 저장 위치: {CURSOR_RULES_DIR}/{CURSOR_RULES_FILE} (총 {len(current_rules)}개 규칙)"
+    else:
+        # 오류 발생 시 오류 메시지 반환
+        logger.error(message)
+        return f"규칙 추가 실패: {message}"
 
+# MCP 도구: 코드 수정을 새 규칙으로 추가
 @mcp.tool()
-def add_code_edit_to_rules(ctx: Context, name: str, description: str, 
-                          original_code: str, modified_code: str, 
-                          feedback: str = "코드 수정", tags: List[str] = None) -> str:
+def mcp_auto_rules_add_code_edit_to_rules(
+    ctx: Context,
+    name: str,
+    description: str,
+    original_code: str,
+    modified_code: str,
+    feedback: str = "코드 수정",
+    tags: Optional[List[str]] = None,
+) -> str:
     """
     코드 수정을 새 규칙으로 추가
     
@@ -310,93 +443,143 @@ def add_code_edit_to_rules(ctx: Context, name: str, description: str,
     - feedback: 수정에 대한 피드백 (기본: "코드 수정")
     - tags: 규칙 태그 (선택사항)
     """
-    rule_manager = ctx.request_context.lifespan_context["rule_manager"]
-    
-    # 새 규칙 생성
-    rule = Rule(
-        name=name,
-        description=description,
-        original_code=original_code,
-        modified_code=modified_code,
-        feedback=feedback,
-        tags=tags or ["코드 수정"]
+    return mcp_auto_rules_add_rule(
+        ctx, name, description, original_code, modified_code, feedback, tags
     )
-    
-    # 규칙 저장
-    rule_manager.save_rule(rule)
-    
-    return f"코드 수정 규칙 추가 성공: {name}"
 
+# MCP 도구: Cursor Rules 문서에서 규칙 추출
 @mcp.tool()
-def extract_cursor_rules(ctx: Context, rules_content: str) -> str:
+def mcp_auto_rules_extract_cursor_rules(
+    ctx: Context,
+    rules_content: str,
+) -> str:
     """
     Cursor Rules 문서 내용에서 규칙 추출
     
     Parameters:
     - rules_content: Cursor Rules 문서 내용
     """
-    # 간단한 구현: 문서에서 규칙 이름과 설명 추출
-    lines = rules_content.strip().split('\n')
-    extracted_rules = []
-    
-    current_rule = None
-    rule_content = []
-    
-    for line in lines:
-        if line.startswith('# ') or line.startswith('## '):
-            # 새 규칙 시작, 이전 규칙 저장
-            if current_rule and rule_content:
-                extracted_rules.append({
-                    "name": current_rule,
-                    "content": '\n'.join(rule_content)
-                })
-                rule_content = []
+    try:
+        # 규칙 추출
+        rules = extract_rules_from_mdc(rules_content)
+        
+        if not rules:
+            return "추출된 규칙이 없습니다."
+        
+        # 현재 규칙 로드
+        current_rules = load_all_rules()
+        
+        # 새 규칙 수와 충돌 수 계산을 위한 변수
+        new_rules_count = 0
+        conflicts_count = 0
+        
+        # 현재 규칙 이름 목록
+        current_rule_names = [rule.get("name") for rule in current_rules if rule.get("name")]
+        
+        # 새 규칙 추가
+        for rule in rules:
+            rule_name = rule.get("name")
             
-            current_rule = line.lstrip('#').strip()
-        elif current_rule:
-            rule_content.append(line)
+            if not rule_name:
+                continue
+            
+            if rule_name in current_rule_names:
+                conflicts_count += 1
+                continue
+            
+            # 규칙 추가
+            success, _ = add_rule(rule)
+            if success:
+                new_rules_count += 1
+        
+        return f"{len(rules)}개 규칙이 추출되었습니다. {new_rules_count}개 새 규칙이 추가되었습니다. {conflicts_count}개 규칙은 이미 존재합니다."
+    except Exception as e:
+        logger.error(f"규칙 추출 중 오류: {e}")
+        return f"규칙 추출 중 오류 발생: {e}"
+
+# MCP 도구: 규칙 삭제
+@mcp.tool()
+def mcp_auto_rules_delete_rule(
+    ctx: Context,
+    rule_name: str,
+) -> str:
+    """
+    규칙 삭제
     
-    # 마지막 규칙 저장
-    if current_rule and rule_content:
-        extracted_rules.append({
-            "name": current_rule,
-            "content": '\n'.join(rule_content)
-        })
+    Parameters:
+    - rule_name: 삭제할 규칙 이름
+    """
+    success, message = delete_rule(rule_name)
     
-    return json.dumps(extracted_rules, ensure_ascii=False, indent=2)
-
-@mcp.prompt()
-def rule_creation_strategy() -> str:
-    """RLHF를 통한 코드 규칙 생성 전략 정의"""
-    return """코드 규칙 생성을 위한 RLHF(Reinforcement Learning from Human Feedback) 전략:
-
-1. 코드 생성 및 피드백 수집:
-   - LLM이 사용자 요청에 따라 코드를 생성합니다.
-   - 사용자가 코드에 대한 피드백을 제공하거나 직접 수정합니다.
-   - 이 피드백과 수정사항을 규칙으로 저장합니다.
-
-2. 패턴 인식:
-   - 비슷한 패턴의 피드백이 반복될 경우 그것을 규칙으로 일반화합니다.
-   - 태그를 사용하여 규칙을 카테고리별로 분류합니다.
-
-3. 규칙 적용:
-   - 이후 코드 생성 시 저장된 규칙을 참조하여 사용자 선호도를 반영합니다.
-   - 코드 생성 전 관련 규칙을 조회하고 적용합니다.
-
-4. 규칙 최적화:
-   - 적용된 규칙의 효과를 평가하고 필요한 경우 수정합니다.
-   - 더 이상 유용하지 않은 규칙은 삭제하거나 업데이트합니다.
-
-규칙 생성 시 고려사항:
-- 규칙은 구체적이고 명확해야 합니다.
-- 코드 스타일, 네이밍 컨벤션, 아키텍처 패턴 등 다양한 측면을 포함할 수 있습니다.
-- 규칙 간 충돌이 없도록 주의해야 합니다.
-- 규칙은 항상 현재 프로젝트의 컨텍스트에 맞게 적용해야 합니다.
-"""
+    if success:
+        current_rules = load_all_rules()
+        return f"{message} 총 {len(current_rules)}개 규칙이 남아있습니다."
+    else:
+        return f"규칙 삭제 실패: {message}"
 
 def main():
-    """MCP 서버 실행"""
-    mcp.run()
+    """MCP 서버 실행 함수"""
+    try:
+        logger.info("AutoRules 서버 시작 중...")
+        logger.info(f"시작 시간: {datetime.now()}")
+        
+        # 환경 변수 AUTO_RULES_ROOT 다시 확인
+        if not auto_rules_root:
+            error_msg = "환경 변수 AUTO_RULES_ROOT가 설정되지 않았습니다. MCP 서버를 종료합니다."
+            logger.error(error_msg)
+            print(error_msg)
+            import sys
+            sys.exit(1)
+        
+        # Cursor Rules 디렉토리 확인 및 생성
+        cursor_rules_dir = Path(auto_rules_root) / CURSOR_RULES_DIR
+        if not cursor_rules_dir.exists():
+            try:
+                cursor_rules_dir.mkdir(exist_ok=True, parents=True)
+                logger.info(f"Cursor Rules directory created at: {cursor_rules_dir}")
+            except Exception as e:
+                error_msg = f"Cursor Rules 디렉토리 생성 실패: {e}, MCP 서버를 종료합니다."
+                logger.error(error_msg)
+                print(error_msg)
+                import sys
+                sys.exit(1)
+        
+        # 규칙 로드
+        rules = load_all_rules()
+        logger.info(f"{len(rules)}개의 규칙 로드됨")
+        
+        # MDC 파일 생성 또는 업데이트
+        mdc_file_path = cursor_rules_dir / CURSOR_RULES_FILE
+        if not mdc_file_path.exists() or rules:
+            logger.info(f"Creating/Updating MDC file: {mdc_file_path}")
+            save_rules_to_mdc(rules)
+        
+        # Cursor Rules 문서에서 자동 규칙 로드 (필요한 경우)
+        try:
+            cursor_rules_path = Path(".cursor/rules/autorules.mdc")
+            if cursor_rules_path.exists():
+                logger.info(f"Found Cursor Rules at {cursor_rules_path}")
+                with open(cursor_rules_path, "r", encoding="utf-8") as f:
+                    rules_content = f.read()
+                    logger.info("Extracting rules from Cursor Rules document")
+                    ctx = Context()  # 임시 Context 객체 생성
+                    result = extract_cursor_rules(ctx, rules_content)
+                    logger.info(f"Extraction result: {result}")
+        except Exception as e:
+            logger.error(f"Error loading Cursor Rules: {e}")
+        
+        # MCP 서버 실행
+        logger.info("Starting MCP server...")
+        logger.info(f"Using AUTO_RULES_ROOT: {auto_rules_root}")
+        logger.info(f"Cursor Rules directory: {cursor_rules_dir}")
+        logger.info(f"Cursor Rules file: {CURSOR_RULES_PATH}")
+        mcp.run()
+    except Exception as e:
+        error_msg = f"Error starting AutoRules server: {e}, MCP 서버를 종료합니다."
+        logger.error(error_msg)
+        print(error_msg)
+        import sys
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
